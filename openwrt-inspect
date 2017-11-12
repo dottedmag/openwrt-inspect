@@ -1,0 +1,207 @@
+#!/usr/bin/python
+import email, requests, os, re, tarfile, gzip, StringIO, sys, hashlib, os.path
+import difflib
+
+verbose = True
+
+cachedir = os.environ['HOME']+'/.cache/dissect-owrt'
+
+def split_para(text):
+    for para in text.split('\n\n'):
+        if para=='':
+            continue
+        yield para
+
+def get_pkgs(status_file):
+    pkgs = {}
+    with open(status_file, 'r') as fh:
+        c = fh.read()
+    for p in split_para(c):
+        #print p
+        m = email.message_from_string(p)
+        status = m['Status'].split(' ')
+        if status[2] != 'installed':
+            continue
+        auto = m.get('Auto-Installed')=='yes'
+        pkgs[m['Package']] = {'version': m['Version'], 'architecture':
+                              m['Architecture'], 'auto': auto}
+    return pkgs
+
+def get(url):
+    if verbose:
+        print 'GET', url
+    res = requests.get(url)
+    res.raise_for_status()
+    return res.content
+
+def source(url):
+    cache_key = hashlib.sha256(url).hexdigest()
+    cache_dir = cachedir+'/sources/'+cache_key
+    if not os.path.isdir(cache_dir):
+        os.makedirs(cache_dir)
+    if os.path.isfile(cache_dir+'/Packages.sig'):
+        with open(cache_dir+'/Packages.sig', 'r') as fh:
+            existing_sig = fh.read()
+    else:
+        existing_sig = ''
+    new_sig = get(url+'/Packages.sig')
+    if existing_sig == new_sig:
+        with open(cache_dir+'/Packages.gz', 'r') as fh:
+            contents = fh.read()
+    else:
+        contents = get(url+'/Packages.gz')
+        with open(cache_dir+'/Packages.gz', 'w') as fh:
+            fh.write(contents)
+        with open(cache_dir+'/Packages.sig', 'w') as fh:
+            fh.write(new_sig)
+    ret = {'url': url, 'packages': {}}
+    for p in split_para(gzip.GzipFile(fileobj=StringIO.StringIO(contents)).read()):
+        p = p.replace('\xe0', '') # Catalan(!) non-ASCII
+        m = email.message_from_string(p)
+        #print m
+        pkginfo = {'filename': m['Filename'], 'sha256sum': m['SHA256sum'],
+                   'version': m['Version'], 'architecture': m['Architecture']}
+        ret['packages'][m['Package']] = pkginfo
+    if url.endswith('base'):
+        ret['packages']['libc'] = {'filename': 'libc_0.9.33.2-1_ar71xx.ipk',
+                                   'sha256sum': '01a890d3361febabd3ec5cf7f3d8ffd9e2cd3b9e11598ad6711fa5b7c0959c24',
+                                   'version': '0.9.33.2-1',
+                                   'architecture': 'ar71xx'}
+        ret['packages']['kernel'] = {
+            'architecture': 'ar71xx',
+            'sha256sum': '2a1d3f0bcd6cea78ce193dffa4f2e1128092b36b540a41110f72bb76bcf71354',
+            'filename': 'kernel_3.18.20-1-7bed08fa9c06eb8089e82c200340ec66_ar71xx.ipk',
+            'version': '3.18.20-1-7bed08fa9c06eb8089e82c200340ec66'}
+    return ret
+
+def filetree(root):
+    allfiles = set()
+    for dirpath, subdirs, filenames in os.walk(root):
+        relpath = dirpath[len(root):]
+        for filename in filenames:
+            allfiles.add(relpath+'/'+filename)
+        for subdir in subdirs:
+            if os.path.islink(dirpath+'/'+subdir):
+                allfiles.add(relpath+'/'+subdir)
+    return allfiles
+
+def get_sources_urls(root):
+    with open(root+'/etc/opkg.conf', 'r') as fh:
+        for line in fh:
+            if line.startswith('src/gz'):
+                _, name, url = line.rstrip('\n').split(' ')
+                yield url
+
+def pkg_contents(source, name):
+    p = source['packages'][name]
+    cache_dir = cachedir+'/packages'
+    cache_key = p['filename']+':'+p['sha256sum']
+    if os.path.isfile(cache_dir+'/'+cache_key):
+        with open(cache_dir+'/'+cache_key, 'r') as fh:
+            contents = fh.read()
+    else:
+        contents = get(source['url']+'/'+p['filename'])
+        if not os.path.isdir(cache_dir):
+            os.makedirs(cache_dir)
+        with open(cache_dir+'/'+cache_key, 'w') as fh:
+            fh.write(contents)
+    with gzip.GzipFile(fileobj=StringIO.StringIO(contents), mode='r') as fh:
+        c = fh.read()
+    ipkg_tar = tarfile.open(fileobj=StringIO.StringIO(c))
+    data_fh = ipkg_tar.extractfile('./data.tar.gz')
+    with gzip.GzipFile(fileobj=data_fh, mode='r') as fh:
+        c = fh.read()
+    data_fh.close()
+    data_tar = tarfile.open(fileobj=StringIO.StringIO(c))
+    return data_tar
+
+def get_tar_member_contents(tar, member):
+    if member.islnk():
+        fh = tar.extractfile(member.linkname)
+    else:
+        fh = tar.extractfile(member)
+    contents = fh.read()
+    fh.close()
+    return contents
+
+# def list_installed(pkgname, root):
+#     with open(root+'/usr/lib/opkg/info/'+pkgname+'.list') as fh:
+#         for line in fh:
+#             yield line.rstrip('\n')
+
+def match_pkg(pkgname, ipk_contents, tree, root):
+    for s in ['prerm', 'list', 'postinst-pkg', 'control', 'postinst',
+              'conffiles', 'prerm-pkg']:
+        tree.discard('/usr/lib/opkg/info/'+pkgname+'.'+s)
+    for member in ipk_contents:
+        if member.isdir():
+            continue
+        pkg_filename = member.name.lstrip('.')
+        if pkg_filename not in tree:
+            print "-------", pkg_filename
+            continue
+        if member.issym():
+            if member.linkname != os.readlink(root+pkg_filename):
+                print "RELINK", pkg_filename
+            else:
+                if verbose:
+                    print "OK "+pkg_filename
+        else:
+            ipk_file_contents = get_tar_member_contents(ipk_contents, member)
+            ipk_file_ck = hashlib.sha256(ipk_file_contents).hexdigest()
+            with open(root+pkg_filename) as fh:
+                ct = fh.read()
+                file_ck = hashlib.sha256(ct).hexdigest()
+                if ipk_file_ck != file_ck:
+                    print 'CHANGED', pkg_filename
+                else:
+                    if verbose:
+                        print "OK "+pkg_filename
+        tree.remove(pkg_filename)
+
+def match_installed(pkgname, info, sources, tree, root):
+    for source in sources:
+        if pkgname in source['packages']:
+            p = source['packages'][pkgname]
+            if info['version'] != p['version']:
+                print pkgname+': '+info['version']+'!='+p['version']
+                sys.exit(1)
+            if info['architecture'] != p['architecture']:
+                print pkgname+': '+info['architecture']+'!='+p['architecture']
+                sys.exit(1)
+            tarfile = pkg_contents(source, pkgname)
+            match_pkg(pkgname, tarfile, tree, root)
+            return
+    print 'unknown package: '+pkgname
+    sys.exit(0)
+
+def run(root):
+    sources = [source(url) for url in get_sources_urls(root)]
+    tree = filetree(root)
+    installed_pkgs = get_pkgs(root+'/usr/lib/opkg/status')
+    for pkgname, info in installed_pkgs.items():
+        if verbose:
+            print "PKG", pkgname
+        match_installed(pkgname, info, sources, tree, root)
+    tree.discard('/usr/lib/opkg/status')
+    skipstuff = set()
+    for f in tree:
+        if f.startswith('/etc/rc.d/S') or f.startswith('/etc/rc.d/K'):
+            skipstuff.add(f)
+    for f in skipstuff:
+        tree.discard(f)
+    for f in sorted(tree):
+        print "EXTRA", f
+    orig_pkgs = get_pkgs(root+'/rom/usr/lib/opkg/status')
+    tree.discard('/rom/usr/lib/opkg/status')
+    for orig_pkgname, orig_info in orig_pkgs.items():
+        if not installed_pkgs.pop(orig_pkgname, None):
+            print "RMPKG", orig_pkgname
+    for pkgname in sorted(installed_pkgs.keys()):
+        if installed_pkgs[pkgname]['auto']:
+            if verbose:
+               print "AUTOPKG", pkgname
+            continue
+        print "NEWPKG", pkgname
+
+run('out')

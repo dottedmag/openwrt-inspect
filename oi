@@ -1,0 +1,24 @@
+#!/usr/local/bin/python3
+
+from pathlib import Path
+import subprocess
+import tarfile
+
+import owi.sources
+
+ROM_CMD = b'cd /rom && tar -c .'
+ROOT_CMD = b'cd / && printf "./dev\n./overlay\n./proc\n./rom\n./sys\n./tmp\n" | tar -c -X- .'
+
+def run_save(cmd, out):
+    with open(out, 'wb') as fhw:
+        subprocess.run([b'ssh', sys.argv[1], cmd], stdout=fhw, check=True)
+
+if not Path('rom.tar').exists():
+    run_save(ROM_CMD, 'rom.tar')
+if not Path('root.tar').exists():
+    run_save(ROOT_CMD, 'root.tar')
+
+romt = tarfile.open('rom.tar', 'r')
+roott = tarfile.open('root.tar', 'r')
+
+owi.sources.system(roott, romt)
